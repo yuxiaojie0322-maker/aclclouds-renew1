@@ -8,28 +8,42 @@ const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const BASE_URL = 'https://dash.aclclouds.com';
 
 // Send Telegram notification
-async function notify(message) {
-  if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
-    console.log('[TG] No bot token or chat ID, skipping notification');
-    return;
+async function notify(message, photoPath) {
+  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
+  
+  if (photoPath) {
+    // Send photo with caption
+    const fs = require('fs');
+    const FormData = require('form-data') || null;
+    const boundary = '----FormBoundary' + Math.random().toString(36).slice(2);
+    const fileData = fs.readFileSync(photoPath);
+    
+    const body = `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${TG_CHAT_ID}\r\n--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${message}\r\n--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="error.png"\r\nContent-Type: image/png\r\n\r\n` + fileData.toString('binary') + `\r\n--${boundary}--\r\n`;
+    
+    return new Promise((resolve, reject) => {
+      const req = https.request(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, {
+        method: 'POST',
+        headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` }
+      }, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => { console.log('[TG] Photo sent'); resolve(data); });
+      });
+      req.on('error', reject);
+      req.write(body, 'binary');
+      req.end();
+    });
   }
-  const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
-  const body = JSON.stringify({
-    chat_id: TG_CHAT_ID,
-    text: message,
-    parse_mode: 'HTML'
-  });
+  
+  const body = JSON.stringify({ chat_id: TG_CHAT_ID, text: message, parse_mode: 'HTML' });
   return new Promise((resolve, reject) => {
-    const req = https.request(url, {
+    const req = https.request(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' }
     }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        console.log('[TG] Notification sent');
-        resolve(data);
-      });
+      res.on('end', () => { console.log('[TG] Notification sent'); resolve(data); });
     });
     req.on('error', reject);
     req.write(body);
@@ -61,7 +75,6 @@ async function notify(message) {
     console.log('[3] Solving captcha...');
     const captcha = page.locator('.auth-captcha-inner').first();
     
-    // Simulate some mouse movement before clicking
     const box = await captcha.boundingBox();
     if (box) {
       await page.mouse.move(box.x - 50, box.y - 30);
@@ -73,14 +86,10 @@ async function notify(message) {
     }
     
     await captcha.click();
-    
-    // Wait for verification
     await page.waitForTimeout(3000);
     
-    // Check if verified
     const verified = await page.locator('.auth-captcha-box.verified').count();
     if (verified === 0) {
-      // Try clicking again
       console.log('[3b] Retrying captcha...');
       await captcha.click();
       await page.waitForTimeout(3000);
@@ -93,12 +102,39 @@ async function notify(message) {
     console.log('[4] Signing in...');
     await page.click('button:has-text("Sign in")');
     
-    // Wait for navigation
+    // Wait for response - check multiple outcomes
     try {
-      await page.waitForURL('**/', { timeout: 15000 });
+      // Wait for either navigation or error message
+      await Promise.race([
+        page.waitForURL('**/', { timeout: 20000 }),
+        page.waitForSelector('.error, .alert-danger, [class*="error"], [class*="toast"]', { timeout: 20000 })
+      ]);
     } catch (e) {
-      await page.screenshot({ path: '/tmp/acl_login_error.png' });
-      throw new Error('Login failed - did not redirect to dashboard');
+      // Timeout - let's check what happened
+    }
+    
+    // Check current URL
+    const currentUrl = page.url();
+    console.log(`  Current URL: ${currentUrl}`);
+    
+    // Check for any visible error/alert text
+    const pageText = await page.textContent('body');
+    const hasError = pageText.match(/error|invalid|incorrect|failed|wrong|captcha|blocked/i);
+    
+    if (currentUrl.includes('/auth/login')) {
+      // Still on login page - something went wrong
+      const screenshotPath = '/tmp/acl_login_error.png';
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      
+      // Get any error messages
+      const errorElements = await page.locator('.error, .alert, [class*="error"], [class*="toast"], .auth-error, p[class*="error"]').allTextContents();
+      const errorMsg = errorElements.filter(t => t.trim()).join(' | ') || 'No error message found';
+      
+      console.log(`  Error: ${errorMsg}`);
+      console.log(`  Page text snippet: ${pageText.substring(0, 500)}`);
+      
+      await notify(`❌ ACLClouds Login Failed\nURL: ${currentUrl}\nError: ${errorMsg}`, screenshotPath);
+      throw new Error(`Login failed - still on login page. Error: ${errorMsg}`);
     }
     
     await page.waitForTimeout(2000);
@@ -122,7 +158,6 @@ async function notify(message) {
 
     // Step 6: Renew each server
     let results = [];
-    let hasRenewed = false;
     for (const server of servers) {
       const { uuid, name, can_renew, expires_at } = server.attributes;
       console.log(`\n--- Server: ${name} (${uuid}) ---`);
@@ -142,23 +177,18 @@ async function notify(message) {
         console.log('  Response:', JSON.stringify(renewResp));
 
         if (renewResp.error) {
-          console.log(`  ⚠️ ${name}: ${renewResp.error}`);
           results.push(`⚠️ ${name}: ${renewResp.error}`);
         } else if (renewResp.requires_payment) {
-          console.log(`  💰 ${name}: Requires payment`);
           results.push(`💰 ${name}: Requires payment`);
         } else {
-          console.log(`  ✅ ${name}: Renewed successfully!`);
           results.push(`✅ ${name}: Renewed!`);
-          hasRenewed = true;
         }
       } else {
-        console.log(`  ⏳ ${name}: Not available yet (expires: ${expires_at})`);
+        console.log(`  ⏳ Not available yet`);
         results.push(`⏳ ${name}: Not available yet (expires: ${expires_at})`);
       }
     }
 
-    // Step 7: Send Telegram notification
     const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
     const msg = `☁️ <b>ACLClouds Auto-Renew</b>\n⏰ ${now}\n\n${results.join('\n')}`;
     await notify(msg);
@@ -169,7 +199,6 @@ async function notify(message) {
 
   } catch (err) {
     console.error('Error:', err.message);
-    await notify(`❌ ACLClouds Renew Error\n${err.message}`);
     process.exit(1);
   } finally {
     await browser.close();
